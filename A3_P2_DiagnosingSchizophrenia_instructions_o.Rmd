@@ -1,0 +1,192 @@
+---
+title: "Assignment 3 - Part 2 - Diagnosing Schizophrenia from Voice"
+author: "Riccardo Fusaroli"
+date: "October 17, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Assignment 3 - Part 2 - Diagnosing schizophrenia from voice
+
+In the previous part of the assignment you generated a bunch of "features", that is, of quantitative descriptors of voice in schizophrenia. We then looked at whether we could replicate results from the previous literature.
+We now want to know whether we can automatically diagnose schizophrenia from voice only, that is, relying on the set of features you produced last time, we will try to produce an automated classifier.
+Again, remember that the dataset containst 7 studies and 3 languages. Feel free to only include Danish (Study 1-4) if you feel that adds too much complexity.
+
+Issues to be discussed your report:
+- Should you run the analysis on all languages/studies at the same time? (hmm, yes on the languages we choose? We have random intercept per study)
+- Choose your best acoustic feature from part 1. How well can you diagnose schizophrenia just using it? 
+- Identify the best combination of acoustic features to diagnose schizophrenia using logistic regression.
+- Discuss the "classification" process: which methods are you using? Which confounds should you be aware of? What are the strength and limitation of the analysis?
+- Bonus question: Logistic regression is only one of many classification algorithms. Try using others and compare performance. Some examples: Discriminant Function, Random Forest, Support Vector Machine, etc. The package caret provides them. (here we use the tidymodels)
+- Bonus Bonus question: It is possible combine the output of multiple  classification models to improve classification accuracy. For inspiration see,
+https://machinelearningmastery.com/machine-learning-ensembles-with-r/
+ The interested reader might also want to look up 'The BigChaos Solution to the Netflix Grand Prize'
+
+## Learning objectives
+- Learn the basics of classification in a machine learning framework
+- Design, fit and report logistic regressions
+- Apply feature selection techniques
+
+### Let's start
+
+We first want to build a logistic regression to see whether you can diagnose schizophrenia from your best acoustic feature. Let's use the full dataset and calculate the different performance measures (accuracy, sensitivity, specificity, PPV, NPV, ROC curve). You need to think carefully as to how we should (or not) use study and subject ID.
+
+Then cross-validate the logistic regression and re-calculate performance on the testing folds. N.B. The cross-validation functions you already have should be tweaked: you need to calculate these new performance measures. Alternatively, the groupdata2 and cvms package created by Ludvig are an easy solution. 
+
+N.B. the predict() function generates log odds (the full scale between minus and plus infinity). Log odds > 0 indicates a choice of 1, below a choice of 0.
+N.N.B. you need to decide whether calculate performance on each single test fold or save all the prediction for test folds in one datase, so to calculate overall performance.
+N.N.N.B. Now you have two levels of structure: subject and study. Should this impact your cross-validation?
+N.N.N.N.B. A more advanced solution could rely on the tidymodels set of packages (warning: Time-consuming to learn as the documentation is sparse, but totally worth it)
+
+
+
+```{r}
+p_load(pacman, tidyverse, tidymodels, groupdata2)
+
+data <- read_csv("data_af.csv")
+data <- data %>% subset(Language == "Danish")
+
+#removing NAs
+data_na <- data[,c(25, 27:30)]
+data_na <- na.omit(data_na)
+data <- data[data$UniqueID %in% data_na$UniqueID,]
+
+data$Diagnosis <- as.factor(data$Diagnosis)
+
+set.seed(69)
+df_list <- partition(data, p = 0.2, cat_col = c("Diagnosis"), id_col = "UniquePair", list_out = T)
+df_test = df_list[[1]]
+df_train = df_list[[2]]
+
+
+```
+
+```{r}
+rec <- df_train %>% recipe(Diagnosis ~ ScaledPitchIQR + ScaledSpokenProb + ScaledPauseDur + ScaledSpeechRate) %>% # center numeric predictors
+  step_corr(all_numeric()) %>% 
+  check_missing(everything()) %>%
+  prep(training = df_train)
+
+train_baked <- juice(rec) # extract df_train from rec
+
+rec #inspect rec
+```
+
+```{r}
+test_baked <- rec %>% bake(df_test)
+
+```
+
+```{r}
+#logistic regression
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") %>%
+  fit(Diagnosis ~  ScaledPitchIQR + ScaledSpokenProb + ScaledSpeechRate + ScaledPauseDur, data = train_baked)
+```
+
+```{r}
+#predict class
+log_class <- log_fit %>%
+  predict(new_data = test_baked)
+#get prob of class
+log_prop <- log_fit %>%
+  predict(new_data = test_baked, type = "prob") %>%
+  pull(.pred_1)
+
+test_results <- 
+  test_baked %>% 
+  select(Diagnosis) %>% 
+  mutate(
+    log_class = predict(log_fit, new_data = test_baked) %>% 
+      pull(.pred_class),
+    log_prob  = predict(log_fit, new_data = test_baked, type = "prob") %>% 
+      pull(.pred_1)
+  )
+
+```
+
+```{r}
+metrics(test_results, truth = Diagnosis, estimate = log_class)
+```
+
+```{r}
+test_results %>%
+  roc_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+```
+
+```{r}
+test_results %>% 
+  mutate(log_prob = 1 - log_prob) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+```
+
+```{r}
+cv_folds <- vfold_cv(df_train, v = 10, repeats = 10, strata = Diagnosis, group=uniquePair)
+
+#prepare data set and fetch train data
+cv_folds <- cv_folds %>% 
+  mutate(recipes = splits %>%
+           # prepper is a wrapper for `prep()` which handles `split` objects
+           map(prepper, recipe = rec),
+         train_data = splits %>% map(training))
+
+# train model of each fold
+  # create a non-fitted model
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") 
+
+
+cv_folds <- cv_folds %>%  mutate(
+  log_fits = pmap(list(recipes, train_data), #input 
+          ~ fit(log_fit, formula(.x), data = bake(object = .x, new_data = .y)) # function to apply
+                 ))
+cv_folds$log_fits$`1`
+```
+
+```{r}
+predict_log <- function(split, rec, model) {
+  # IN
+    # split: a split data
+    # rec: recipe to prepare the data
+    # 
+  # OUT
+    # a tibble of the actual and predicted results
+  baked_test <- bake(rec, testing(split))
+  tibble(
+    actual = baked_test$Diagnosis,
+    predicted = predict(model, new_data = baked_test) %>% pull(.pred_class),
+    prop_scz =  predict(model, new_data = baked_test, type = "prob") %>% pull(.pred_1),
+    prop_non_scz =  predict(model, new_data = baked_test, type = "prob") %>% pull(`.pred_0`)
+  ) 
+}
+
+# apply our function to each split, which their respective recipes and models (in this case log fits) and save it to a new col
+cv_folds <- cv_folds %>% 
+  mutate(pred = pmap(list(splits, recipes, log_fits) , predict_log))
+```
+
+```{r}
+eval <- 
+  cv_folds %>% 
+  mutate(
+    metrics = pmap(list(pred), ~ metrics(., truth = actual, estimate = predicted, prop_scz))) %>% 
+  select(id, id2, metrics) %>% 
+  unnest(metrics)
+
+#inspect performance metrics
+eval_df <- eval %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) %>% arrange(desc(kap)) 
+eval_df
+eval_df %>% summarize(mAccuracy = mean(accuracy), mKap = mean(kap), mMnlogloss = mean(mn_log_loss), mROC = mean(roc_auc))
+```
+

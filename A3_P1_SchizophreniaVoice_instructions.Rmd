@@ -105,9 +105,9 @@ read_pitch <- function(filename) {
     filename <- paste("data/Pitch/", filename, sep="")
     pitch <- read_tsv(filename)
     # parse filename to extract study, diagnosis, subject and trial
-    Study <- filename %>% str_extract("Study\\d") %>% gsub("Study", "", .)
+    Study <- filename %>% str_extract("Study\\d") %>% gsub("Study", "", .) 
     Diagnosis <- filename %>% str_extract("D\\d") %>% gsub("D", "", .)
-    Participant <- filename %>% str_extract("S\\d+") %>% gsub("S", "", .)
+    Participant <- filename %>% str_extract("S\\d+") %>% gsub("S", "", .) %>% gsub("^0+", "", .)
     Trial <- filename %>% str_extract("T\\d+") %>% gsub("T", "", .)
     # extract pitch descriptors (mean, sd, iqr, etc)
     Mean <- mean(pitch$f0)
@@ -128,26 +128,91 @@ write_csv(pitch_data, "pitch_data.csv")
 ```{r message=}
 # Let's start with the demographic and clinical data
 demo <- read_delim("data/DemographicData.csv", delim=";")
+demo$Diagnosis <- ifelse(demo$Diagnosis == "Control", 0, 1)
+demo$Participant <- demo$Participant %>% gsub("^0+", "",.)
 # then duration data
 art <- read_csv("data/Articulation.txt")
-art$Participant <- art$soundname %>% str_extract("S\\d+") %>% gsub("S", "", .) %>% gsub("^0+", "", .)
-art$Study <- art$soundname %>% str_extract("Study\\d") %>% gsub("Study", "", .) 
+art$Participant <- art$soundname %>% str_extract("S\\d+") %>% gsub("S", "", .) %>% gsub("^0+", "",.)
+art$Study <- art$soundname %>% str_extract("Study\\d") %>% gsub("Study", "", .)
+art$Diagnosis <- art$soundname %>% str_extract("D\\d") %>% gsub("D", "", .)
+art$Trial <- art$soundname %>% str_extract("T\\d+") %>% gsub("T", "", .) %>% as.integer(.)
 # Finally the pitch data
 pitch <- read_csv("pitch_data.csv")
 # Now we merge them
-df <- demo %>% merge(pitch, all = T, by=c("Participant", "Study")) %>% merge(art, all=T, by=c("Participant", "Study"))
+df <- demo %>% 
+    merge(pitch, all = T, by=c("Participant", "Study", "Diagnosis")) %>% 
+    merge(art, all=T, by=c("Participant", "Study", "Diagnosis", "Trial"))
+
+df$UniquePair <- paste("P", as.character(df$Participant), "S", as.character(df$Study), sep="")
+df$UniqueID <- paste("P", as.character(df$Participant), "S", as.character(df$Study), "D", as.character(df$Diagnosis), sep="")
+df$UniqueID <- as.integer(as.factor(df$UniqueID))
+df$UniquePair <- as.integer(as.factor(df$UniquePair))
+unique(df$Trial)
 # Now we save them
 write_csv(df, "A3_data_merged.csv")
+
+
 ```
 
 ## Now we need to describe our sample
 
 First look at the missing data: we should exclude all recordings for which we do not have complete data.
-Then count the participants and recordinsgs by diagnosis, report their gender, age and symptom severity (SANS, SAPS and Social)
+Then count the participants and recordinsgs by diagnosis, report their gender, age and symptom severity (SANS, SAPS)
 Finally, do the same by diagnosis and study, to assess systematic differences in studies.
 I like to use group_by() %>% summarize() for quick summaries
 
 ```{r}
+df %>% 
+    group_by(Diagnosis) %>% 
+    summarise(
+        N=n(),
+        femaleN = sum(Gender=="F", na.rm=T),
+        maleN = sum(Gender == "M", na.rm=T),
+        mmPitch = mean(Mean, na.rm=T),
+        mSDPitch = mean(SD, na.rm=T),
+        mIQRPitch = mean(IQR, na.rm=T),
+        sdAge = sd(Age, na.rm=T),
+        iqrAge = IQR(Age, na.rm=T),
+        minAge = min(Age, na.rm=T),
+        maxAge = max(Age, na.rm=T),
+        mAge = mean(Age, na.rm=T),
+        mSANS = mean(SANS, na.rm=T),
+        sdSANS = sd(SANS, na.rm=T),
+        mSAPS = mean(SAPS, na.rm=T),
+        sdSAPS = sd(SAPS, na.rm=T),
+        mVerbalIQ = mean(VerbalIQ, na.rm=T),
+        mNonVerbalIQ = mean(NonVerbalIQ, na.rm=T),
+        mTotalIQ = mean(TotalIQ, na.rm=T))
+df %>% 
+    group_by(Diagnosis, Study) %>% 
+    summarise(
+        N=n(),
+        femaleN = sum(Gender=="F", na.rm=T),
+        maleN = sum(Gender == "M", na.rm=T),
+        mmPitch = mean(Mean, na.rm=T),
+        mSDPitch = mean(SD, na.rm=T),
+        mIQRPitch = mean(IQR, na.rm=T),
+        sdAge = sd(Age, na.rm=T),
+        iqrAge = IQR(Age, na.rm=T),
+        minAge = min(Age, na.rm=T),
+        maxAge = max(Age, na.rm=T),
+        mAge = mean(Age, na.rm=T),
+        mSANS = mean(SANS, na.rm=T),
+        sdSANS = sd(SANS, na.rm=T),
+        mSAPS = mean(SAPS, na.rm=T),
+        sdSAPS = sd(SAPS, na.rm=T),
+        mVerbalIQ = mean(VerbalIQ, na.rm=T),
+        mNonVerbalIQ = mean(NonVerbalIQ, na.rm=T),
+        mTotalIQ = mean(TotalIQ, na.rm=T))
+
+
+colnames(df)[colnames(df) == "Mean"] <- "PitchMean"
+colnames(df)[colnames(df) == "SD"] <- "PitchSD"
+colnames(df)[colnames(df) == "IQR"] <- "PitchIQR"
+
+#An inequality in a filter only keeps the values which are TRUE. This implicitly removes both the values which are False and NA.
+df <- df %>% filter(Study != 7)
+
 
 ```
 
@@ -168,6 +233,34 @@ N.N.N.B. If you want to estimate the studies separately, you can try this syntax
 - Bonus points: cross-validate the models and report the betas and standard errors from all rounds to get an idea of how robust the estimates are. 
 
 ```{r}
+p_load(lmerTest, effsize)
+df$npause[df$npause == 0] <- NA
+
+df$scaledPitchIQR <- (df$PitchIQR - mean(df$PitchIQR, na.rm=T)) / sd(df$PitchIQR, na.rm=T)
+df$scaledSpokenProp <- (df$`phonationtime (s)`/df$`dur (s)` - mean(df$`phonationtime (s)`/df$`dur (s)`, na.rm=T)) / sd(df$`phonationtime (s)`/df$`dur (s)`, na.rm=T)
+df$scaledSpeechRate <- (df$`speechrate (nsyll/dur)` - mean(df$`speechrate (nsyll/dur)`, na.rm=T)) / sd(df$`speechrate (nsyll/dur)`, na.rm=T)
+
+df$scaledPauseDur <- (((df$`dur (s)` - df$`phsonationtime (s)`)/df$npause) - mean((df$`dur (s)` - df$`phonationtime (s)`)/df$npause, na.rm=T)) / sd((df$`dur (s)`-df$`phonationtime (s)`)/df$npause, na.rm=T)
+
+df$scaledPauseDur[is.na(df$scaledPauseDur)] <- 0
+
+m1.pair <- lmer(scaledPitchIQR ~ Diagnosis + (1 + Diagnosis|UniquePair), REML=F, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F), data=df)
+m1 <- lmer(scaledPitchIQR ~ Diagnosis + (1|UniqueID), data=df, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F))
+summary(m1)
+
+m2.pair <- lmer(scaledSpokenProp ~ Diagnosis + (1 + Diagnosis|UniquePair), REML=F, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F), data=df)
+m2 <- lmer(scaledSpokenProp ~ Diagnosis + (1|UniqueID), data=df, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F))
+summary(m2)
+
+m3.pair <- lmer(scaledSpeechRate ~ Diagnosis + (1 + Diagnosis|UniquePair), REML=F, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F), data=df)
+m3 <- lmer(scaledSpeechRate ~ Diagnosis + (1|UniqueID), data=df, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F))
+summary(m3)
+
+m4.pair <- lmer(scaledPauseDur ~ Diagnosis + (1 + Diagnosis|UniquePair), REML=F, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F), data=df)
+m4 <- lmer(scaledPauseDur ~ Diagnosis + (1|UniqueID), data=df, control=lmerControl(optimizer = "nloptwrap", calc.derivs=F))
+summary(m4)
+
+anova(m3,m4)
 
 ```
 

@@ -2,7 +2,9 @@
 title: "Assignment 3 - Part 2 - Diagnosing Schizophrenia from Voice"
 author: "Riccardo Fusaroli"
 date: "October 17, 2017"
-output: html_document
+output:   
+  md_document:
+    variant: markdown_github
 ---
 
 ```{r setup, include=FALSE}
@@ -37,15 +39,535 @@ We first want to build a logistic regression to see whether you can diagnose sch
 Then cross-validate the logistic regression and re-calculate performance on the testing folds. N.B. The cross-validation functions you already have should be tweaked: you need to calculate these new performance measures. Alternatively, the groupdata2 and cvms package created by Ludvig are an easy solution. 
 
 N.B. the predict() function generates log odds (the full scale between minus and plus infinity). Log odds > 0 indicates a choice of 1, below a choice of 0.
-N.N.B. you need to decide whether calculate performance on each single test fold or save all the prediction for test folds in one datase, so to calculate overall performance.
+N.N.B. you need to decide whether calculate performance on each single test fold or save all the prediction for test folds in one dataset, so to calculate overall performance.
 N.N.N.B. Now you have two levels of structure: subject and study. Should this impact your cross-validation?
 N.N.N.N.B. A more advanced solution could rely on the tidymodels set of packages (warning: Time-consuming to learn as the documentation is sparse, but totally worth it)
 
-
-
 ```{r}
-
-
-
+# Loading packages
+library(pacman)
+p_load(tidyverse, tidymodels, groupdata2)
 ```
+
+## Creating training and test data set
+```{r}
+# Reading data
+data <- read_csv("data_AF.csv")
+
+# Removing NA's
+df <- filter(data, !is.na(ScaledPitchIQR))
+df <- filter(df, !is.na(ScaledSpokenProp))
+df <- filter(df, !is.na(ScaledSpeechRate))
+df <- filter(df, !is.na(ScaledPauseDur))
+
+#Changing Diagnosis to factor
+df$Diagnosis <- as.factor(df$Diagnosis)
+
+# Partitioning the data
+set.seed(69)
+df_list <- partition(df, p = 0.2, cat_col = c("Diagnosis"), id_col = c("uniquepairID"), list_out = T)
+df_test = df_list[[1]]
+df_train = df_list[[2]]
+
+
+ls.str(df_train)
+```
+
+
+# Create recipe for ONLY ScaledSpeechRate as it was the feature that was described the best by Diagnosis
+```{r}
+rec <- df_train %>% recipe(Diagnosis ~ ScaledSpeechRate + ScaledPitchIQR + ScaledPauseDur) %>% # defines the outcome
+  step_center(all_numeric()) %>% # center numeric predictors
+ # step_scale(all_numeric()) %>% # scales numeric predictors
+  step_corr(all_numeric()) %>% 
+  check_missing(everything()) %>%
+  prep(training = df_train)
+
+train_baked <- juice(rec) # extract df_train from rec
+
+rec #inspect rec
+
+# Applying recipe to test
+test_baked <- rec %>% bake(df_test)
+
+# Seeing if our recipes are the same
+juice(rec)
+rec %>% bake(df_train) # the recipes are the same, however columns are changes
+
+# Creating models
+# logistic regression
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") %>%
+  fit(Diagnosis ~ ScaledSpeechRate, data = train_baked)
+
+# Applying model to test data
+#predict class
+log_class <- log_fit %>%
+  predict(new_data = test_baked)
+#get prob of class
+log_prop <- log_fit %>%
+  predict(new_data = test_baked, type = "prob") %>%
+  pull(.pred_1)
+
+#get multiple at once
+test_results <- 
+  test_baked %>% 
+  select(Diagnosis) %>% 
+  mutate(
+    log_class = predict(log_fit, new_data = test_baked) %>% 
+      pull(.pred_class),
+    log_prob  = predict(log_fit, new_data = test_baked, type = "prob") %>% 
+      pull(.pred_1))
+
+test_results %>% 
+  head(5) 
+
+# Performance metrics including PPV, NPV, sensitivity, specificity, kappa and accuracy
+#full_eval <- as_tibble(bind_rows(ppv(test_results, truth = Diagnosis, estimate = log_class), 
+#           npv(test_results, truth = Diagnosis, estimate = log_class),
+#            sens(test_results, truth = Diagnosis, estimate = log_class),
+#            spec(test_results, truth = Diagnosis, estimate = log_class),
+#            metrics(test_results, truth = Diagnosis, estimate = log_class)))
+
+multimetric <- metric_set(accuracy, bal_accuracy, sens, yardstick::spec, ppv, npv, kap)
+full_eval <- multimetric(bind_cols(test_baked, test_results), truth = Diagnosis, estimate = log_class)  
+full_eval
+
+# plotting the roc curve:
+test_results %>%
+  roc_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+
+# plotting the gain curve
+test_results %>% 
+  mutate(log_prob = 1 - log_prob) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+  
+```
+
+# Cross-Validation on ScaledSpeechRate
+```{r}
+p_load(gganimate, gifski, png)
+# Multiple cross validation
+set.seed(69)
+# create 10 folds, 10 times, and make sure Suicide_Risk is balances across groups
+cv_folds <- vfold_cv(df_train, v = 10, repeats = 10, strata = Diagnosis, group = uniquepairID)
+
+#prepare data set and fetch train data
+cv_folds <- cv_folds %>% 
+  mutate(recipes = splits %>%
+           # prepper is a wrapper for `prep()` which handles `split` objects
+           map(prepper, recipe = rec),
+         train_data = splits %>% map(training))
+
+# train model of each fold
+  # create a non-fitted model
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") 
+
+
+cv_folds <- cv_folds %>%  mutate(
+  log_fits = pmap(list(recipes, train_data), #input 
+                            ~ fit(log_fit, formula(.x), data = bake(object = .x, new_data = .y)) # function to apply
+                 ))
+cv_folds %>% head(5)
+
+predict_log <- function(split, rec, model) {
+  # IN
+    # split: a split data
+    # rec: recipe to prepare the data
+    # 
+  # OUT
+    # a tibble of the actual and predicted results
+  baked_test <- bake(rec, testing(split))
+  tibble(
+    actual = baked_test$Diagnosis,
+    predicted = predict(model, new_data = baked_test) %>% pull(.pred_class),
+    prop_SCZ =  predict(model, new_data = baked_test, type = "prob") %>% pull(.pred_1),
+    prop_control =  predict(model, new_data = baked_test, type = "prob") %>% pull(.pred_0)
+  ) 
+}
+
+# apply our function to each split, which their respective recipes and models (in this case log fits) and save it to a new col
+cv_folds <- cv_folds %>% 
+  mutate(pred = pmap(list(splits, recipes, log_fits) , predict_log))
+
+# Performance metrics
+eval <- 
+  cv_folds %>% 
+  mutate(
+    metrics = pmap(list(pred), ~ multimetric(., truth = actual, estimate = predicted, prop_SCZ))) %>% 
+  select(id, id2, metrics) %>% 
+  unnest(metrics)
+
+#inspect performance metrics
+multimetric2 <- metric_set(roc_auc, accuracy, bal_accuracy, sens, yardstick::spec, ppv, npv, kap)
+eval %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) %>% 
+  arrange(desc(kap)) %>% 
+  head()
+
+
+# Creating dataset with mean of all metrics.
+evalmetrics <- eval %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) 
+
+mean_eval <- evalmetrics %>% summarize(
+  mean(accuracy),
+  mean(bal_accuracy),
+  mean(kap),
+  mean(npv),
+  mean(ppv),
+  mean(sens),
+  mean(spec)
+)
+mean_eval %>% head()
+
+cv_folds %>% 
+  mutate(roc = pmap(list(pred), roc_curve, truth = actual, prop_SCZ)) %>% 
+  unnest(roc) %>%
+  mutate(idval=as.integer(gsub("Fold", "", id2))) %>% 
+  ggplot() + transition_reveal(idval) + transition_reveal(sensitivity) +
+  aes(x = 1 - specificity, y = sensitivity, color = id2) +
+  geom_path() +
+  geom_abline(lty = 3) + facet_wrap(~id)
+
+anim_save("cv.png")
+```
+
+# Create recipe for ALL predictors to see if they are better at classifying
+```{r}
+rec <- df_train %>% recipe(Diagnosis ~ ScaledSpeechRate + ScaledPitchIQR + ScaledPauseDur) %>% # defines the outcome
+  step_center(all_numeric()) %>% # center numeric predictors
+ # step_scale(all_numeric()) %>% # scales numeric predictors
+  step_corr(all_numeric()) %>% 
+  check_missing(everything()) %>%
+  prep(training = df_train)
+
+train_baked <- juice(rec) # extract df_train from rec
+
+rec #inspect rec
+
+# Applying recipe to test
+test_baked <- rec %>% bake(df_test)
+
+# Seeing if our recipes are the same
+juice(rec)
+rec %>% bake(df_train) # the recipes are the same, however columns are changes
+
+# Creating models
+# logistic regression
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") %>%
+  fit(Diagnosis ~., data = train_baked)
+
+# Applying model to test data
+#predict class
+log_class <- log_fit %>%
+  predict(new_data = test_baked)
+#get prob of class
+log_prop <- log_fit %>%
+  predict(new_data = test_baked, type = "prob") %>%
+  pull(.pred_1)
+
+#get multiple at once
+test_results <- 
+  test_baked %>% 
+  select(Diagnosis) %>% 
+  mutate(
+    log_class = predict(log_fit, new_data = test_baked) %>% 
+      pull(.pred_class),
+    log_prob  = predict(log_fit, new_data = test_baked, type = "prob") %>% 
+      pull(.pred_1))
+
+test_results %>% 
+  head(5) 
+
+# Performance metrics including PPV, NPV, sensitivity, specificity, kappa and accuracy
+#full_eval <- as_tibble(bind_rows(ppv(test_results, truth = Diagnosis, estimate = log_class), 
+#           npv(test_results, truth = Diagnosis, estimate = log_class),
+#            sens(test_results, truth = Diagnosis, estimate = log_class),
+#            spec(test_results, truth = Diagnosis, estimate = log_class),
+#            metrics(test_results, truth = Diagnosis, estimate = log_class)))
+
+multimetric <- metric_set(accuracy, bal_accuracy, sens, yardstick::spec, ppv, npv, kap)
+full_eval <- multimetric(bind_cols(test_baked, test_results), truth = Diagnosis, estimate = log_class)  
+full_eval
+
+# plotting the roc curve:
+test_results %>%
+  roc_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+
+# plotting the gain curve
+test_results %>% 
+  mutate(log_prob = 1 - log_prob) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+```
+
+# Cross-Validation on ALL predictors
+```{r}
+# Multiple cross validation
+set.seed(69)
+# create 10 folds, 10 times, and make sure Suicide_Risk is balances across groups
+cv_folds <- vfold_cv(df_train, v = 10, repeats = 10, strata = Diagnosis, group = uniquepairID)
+
+#prepare data set and fetch train data
+cv_folds <- cv_folds %>% 
+  mutate(recipes = splits %>%
+           # prepper is a wrapper for `prep()` which handles `split` objects
+           map(prepper, recipe = rec),
+         train_data = splits %>% map(training))
+
+# train model of each fold
+  # create a non-fitted model
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") 
+
+
+cv_folds <- cv_folds %>%  mutate(
+  log_fits = pmap(list(recipes, train_data), #input 
+                            ~ fit(log_fit, formula(.x), data = bake(object = .x, new_data = .y)) # function to apply
+                 ))
+cv_folds %>% head(5)
+
+predict_log <- function(split, rec, model) {
+  # IN
+    # split: a split data
+    # rec: recipe to prepare the data
+    # 
+  # OUT
+    # a tibble of the actual and predicted results
+  baked_test <- bake(rec, testing(split))
+  tibble(
+    actual = baked_test$Diagnosis,
+    predicted = predict(model, new_data = baked_test) %>% pull(.pred_class),
+    prop_SCZ =  predict(model, new_data = baked_test, type = "prob") %>% pull(.pred_1),
+    prop_control =  predict(model, new_data = baked_test, type = "prob") %>% pull(.pred_0)
+  ) 
+}
+
+# apply our function to each split, which their respective recipes and models (in this case log fits) and save it to a new col
+cv_folds <- cv_folds %>% 
+  mutate(pred = pmap(list(splits, recipes, log_fits) , predict_log))
+
+# Performance metrics
+eval <- 
+  cv_folds %>% 
+  mutate(
+    metrics = pmap(list(pred), ~ multimetric(., truth = actual, estimate = predicted, prop_SCZ))) %>% 
+  select(id, id2, metrics) %>% 
+  unnest(metrics)
+
+#inspect performance metrics
+multimetric2 <- metric_set(roc_auc, accuracy, bal_accuracy, sens, yardstick::spec, ppv, npv, kap)
+eval %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) %>% 
+  arrange(desc(kap)) %>% 
+  head()
+
+
+# Creating dataset with mean of all metrics.
+evalmetrics <- eval %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) 
+
+mean_eval <- evalmetrics %>% summarize(
+  mean(accuracy),
+  mean(bal_accuracy),
+  mean(kap),
+  mean(npv),
+  mean(ppv),
+  mean(sens),
+  mean(spec)
+)
+mean_eval %>% head()
+
+cv_folds %>% 
+  mutate(roc = pmap(list(pred), roc_curve, truth = actual, prop_SCZ)) %>% 
+  unnest(roc) %>% 
+  ggplot() +
+  aes(x = 1 - specificity, y = sensitivity, color = id2) +
+  geom_path() +
+  geom_abline(lty = 3) + facet_wrap(~id)
+```
+
+
+# Running model and evaluations for ScaledSpeechRate and ScaledPitchIQR
+```{r}
+rec <- df_train %>% recipe(Diagnosis ~ ScaledSpeechRate + ScaledPitchIQR) %>% # defines the outcome
+  step_center(all_numeric()) %>% # center numeric predictors
+ # step_scale(all_numeric()) %>% # scales numeric predictors
+  step_corr(all_numeric()) %>% 
+  check_missing(everything()) %>%
+  prep(training = df_train)
+
+train_baked <- juice(rec) # extract df_train from rec
+
+rec #inspect rec
+
+# Applying recipe to test
+test_baked <- rec %>% bake(df_test)
+
+# Seeing if our recipes are the same
+juice(rec)
+rec %>% bake(df_train) # the recipes are the same, however columns are changes
+
+# Creating models
+# logistic regression
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") %>%
+  fit(Diagnosis ~ ScaledSpeechRate + ScaledPitchIQR, data = train_baked)
+
+# Applying model to test data
+#predict class
+log_class <- log_fit %>%
+  predict(new_data = test_baked)
+#get prob of class
+log_prop <- log_fit %>%
+  predict(new_data = test_baked, type = "prob") %>%
+  pull(.pred_1)
+
+#get multiple at once
+test_results <- 
+  test_baked %>% 
+  select(Diagnosis) %>% 
+  mutate(
+    log_class = predict(log_fit, new_data = test_baked) %>% 
+      pull(.pred_class),
+    log_prob  = predict(log_fit, new_data = test_baked, type = "prob") %>% 
+      pull(.pred_1))
+
+test_results %>% 
+  head(5) 
+
+# Performance metrics including PPV, NPV, sensitivity, specificity, kappa and accuracy
+#full_eval <- as_tibble(bind_rows(ppv(test_results, truth = Diagnosis, estimate = log_class), 
+#           npv(test_results, truth = Diagnosis, estimate = log_class),
+#            sens(test_results, truth = Diagnosis, estimate = log_class),
+#            spec(test_results, truth = Diagnosis, estimate = log_class),
+#            metrics(test_results, truth = Diagnosis, estimate = log_class)))
+
+multimetric <- metric_set(accuracy, bal_accuracy, sens, yardstick::spec, ppv, npv, kap)
+full_eval <- multimetric(bind_cols(test_baked, test_results), truth = Diagnosis, estimate = log_class)  
+full_eval
+
+# plotting the roc curve:
+test_results %>%
+  roc_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+
+# plotting the gain curve
+test_results %>% 
+  mutate(log_prob = 1 - log_prob) %>% # for the plot to show correctly (otherwise the line would be flipped)
+  gain_curve(truth = Diagnosis, log_prob) %>% 
+  autoplot()
+```
+
+
+# Cross-Validation on two predictors
+```{r}
+# Multiple cross validation
+set.seed(69)
+# create 10 folds, 10 times, and make sure Suicide_Risk is balances across groups
+cv_folds <- vfold_cv(df_train, v = 10, repeats = 10, strata = Diagnosis, group = uniquepairID)
+
+#prepare data set and fetch train data
+cv_folds <- cv_folds %>% 
+  mutate(recipes = splits %>%
+           # prepper is a wrapper for `prep()` which handles `split` objects
+           map(prepper, recipe = rec),
+         train_data = splits %>% map(training))
+
+# train model of each fold
+  # create a non-fitted model
+log_fit <- 
+  logistic_reg() %>%
+  set_mode("classification") %>% 
+  set_engine("glm") 
+
+
+cv_folds <- cv_folds %>%  mutate(
+  log_fits = pmap(list(recipes, train_data), #input 
+                            ~ fit(log_fit, formula(.x), data = bake(object = .x, new_data = .y)) # function to apply
+                 ))
+cv_folds %>% head(5)
+
+predict_log <- function(split, rec, model) {
+  # IN
+    # split: a split data
+    # rec: recipe to prepare the data
+    # 
+  # OUT
+    # a tibble of the actual and predicted results
+  baked_test <- bake(rec, testing(split))
+  tibble(
+    actual = baked_test$Diagnosis,
+    predicted = predict(model, new_data = baked_test) %>% pull(.pred_class),
+    prop_SCZ =  predict(model, new_data = baked_test, type = "prob") %>% pull(.pred_1),
+    prop_control =  predict(model, new_data = baked_test, type = "prob") %>% pull(.pred_0)
+  ) 
+}
+
+# apply our function to each split, which their respective recipes and models (in this case log fits) and save it to a new col
+cv_folds <- cv_folds %>% 
+  mutate(pred = pmap(list(splits, recipes, log_fits) , predict_log))
+
+# Performance metrics
+eval <- 
+  cv_folds %>% 
+  mutate(
+    metrics = pmap(list(pred), ~ multimetric(., truth = actual, estimate = predicted, prop_SCZ))) %>% 
+  select(id, id2, metrics) %>% 
+  unnest(metrics)
+
+#inspect performance metrics
+multimetric2 <- metric_set(roc_auc, accuracy, bal_accuracy, sens, yardstick::spec, ppv, npv, kap)
+eval %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) %>% 
+  arrange(desc(kap)) %>% 
+  head()
+
+
+# Creating dataset with mean of all metrics.
+evalmetrics <- eval %>% 
+  select(repeat_n = id, fold_n = id2, metric = .metric, estimate = .estimate) %>% 
+  spread(metric, estimate) 
+
+mean_eval <- evalmetrics %>% summarize(
+  mean(accuracy),
+  mean(bal_accuracy),
+  mean(kap),
+  mean(npv),
+  mean(ppv),
+  mean(sens),
+  mean(spec)
+)
+mean_eval %>% head()
+
+cv_folds %>% 
+  mutate(roc = pmap(list(pred), roc_curve, truth = actual, prop_SCZ)) %>% 
+  unnest(roc) %>% 
+  ggplot() +
+  aes(x = 1 - specificity, y = sensitivity, color = id2) +
+  geom_path() +
+  geom_abline(lty = 3) + facet_wrap(~id)
+```
+
 
